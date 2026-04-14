@@ -6,7 +6,7 @@ import { readConfigFile, writeConfigFile } from '../../config/loader';
 import type { Config } from '../../config/schema';
 import type { GlobalFlags } from '../../types/flags';
 
-const VALID_KEYS = ['region', 'base_url', 'output', 'timeout', 'api_key', 'default_text_model', 'default_speech_model', 'default_video_model', 'default_music_model'];
+const VALID_KEYS = ['region', 'base_url', 'provider', 'azure_api_version', 'output', 'timeout', 'api_key', 'default_text_model', 'default_speech_model', 'default_video_model', 'default_music_model'];
 
 // Allow hyphen-style keys (e.g. default-text-model → default_text_model)
 const KEY_ALIASES: Record<string, string> = {
@@ -21,13 +21,16 @@ export default defineCommand({
   description: 'Set a config value',
   usage: 'mmx config set --key <key> --value <value>',
   options: [
-    { flag: '--key <key>', description: 'Config key (region, base_url, output, timeout, api_key, default_text_model, default_speech_model, default_video_model, default_music_model)' },
+    { flag: '--key <key>', description: 'Config key (region, base_url, provider, azure_api_version, output, timeout, api_key, default_text_model, default_speech_model, default_video_model, default_music_model)' },
     { flag: '--value <value>', description: 'Value to set' },
   ],
   examples: [
     'mmx config set --key output --value json',
     'mmx config set --key timeout --value 600',
     'mmx config set --key base_url --value https://api-uw.minimax.io',
+    'mmx config set --key provider --value openai',
+    'mmx config set --key base_url --value https://my-resource.openai.azure.com',
+    'mmx config set --key azure_api_version --value 2024-08-01-preview',
   ],
   async run(config: Config, flags: GlobalFlags) {
     const key = flags.key as string | undefined;
@@ -55,6 +58,13 @@ export default defineCommand({
     if (resolvedKey === 'region' && !['global', 'cn'].includes(value)) {
       throw new CLIError(
         `Invalid region "${value}". Valid values: global, cn`,
+        ExitCode.USAGE,
+      );
+    }
+
+    if (resolvedKey === 'provider' && !['minimax', 'openai', 'azure'].includes(value)) {
+      throw new CLIError(
+        `Invalid provider "${value}". Valid values: minimax, openai, azure`,
         ExitCode.USAGE,
       );
     }

@@ -21,6 +21,7 @@ export default defineCommand({
     const result: Record<string, unknown> = {
       region: config.region,
       base_url: config.baseUrl,
+      provider: config.provider,
       output: config.output,
       timeout: config.timeout,
       config_file: getConfigPath(),
@@ -32,6 +33,8 @@ export default defineCommand({
     }
 
     // Default models
+    if (config.provider === 'azure' && config.azureApiVersion) result.azure_api_version = config.azureApiVersion;
+
     if (file.default_text_model) result.default_text_model = file.default_text_model;
     if (file.default_speech_model) result.default_speech_model = file.default_speech_model;
     if (file.default_video_model) result.default_video_model = file.default_video_model;

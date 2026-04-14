@@ -1,7 +1,8 @@
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'fs';
-import { parseConfigFile, REGIONS, type Config, type ConfigFile, type Region } from './schema';
+import { parseConfigFile, REGIONS, type Config, type ConfigFile, type Region, type Provider } from './schema';
 import { ensureConfigDir, getConfigPath } from './paths';
 import { detectOutputFormat, type OutputFormat } from '../output/formatter';
+import { detectProvider } from '../client/providers';
 import type { GlobalFlags } from '../types/flags';
 
 export function readConfigFile(): ConfigFile {
@@ -46,6 +47,18 @@ export function loadConfig(flags: GlobalFlags): Config {
     || REGIONS[region]
     || REGIONS.global;
 
+  // Provider: explicit config/env wins; otherwise auto-detect from base URL.
+  const envProvider = process.env.MINIMAX_PROVIDER as Provider | undefined;
+  const provider: Provider =
+    (envProvider && ['minimax', 'openai', 'azure'].includes(envProvider) ? envProvider : undefined)
+    ?? file.provider
+    ?? detectProvider(baseUrl);
+
+  const azureApiVersion =
+    process.env.AZURE_OPENAI_API_VERSION
+    || file.azure_api_version
+    || '2024-08-01-preview';
+
   const output: OutputFormat = detectOutputFormat(
     flags.output || process.env.MINIMAX_OUTPUT || file.output,
   );
@@ -62,6 +75,8 @@ export function loadConfig(flags: GlobalFlags): Config {
     configPath: getConfigPath(),
     region,
     baseUrl,
+    provider,
+    azureApiVersion,
     output,
     timeout,
     defaultTextModel: file.default_text_model,

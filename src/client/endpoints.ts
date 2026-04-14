@@ -2,6 +2,32 @@ export function chatEndpoint(baseUrl: string): string {
   return `${baseUrl}/anthropic/v1/messages`;
 }
 
+/**
+ * OpenAI Chat Completions endpoint.
+ * Works for any OpenAI-compatible API (openai.com, local proxies, etc.).
+ */
+export function openaiChatEndpoint(baseUrl: string): string {
+  return `${baseUrl}/v1/chat/completions`;
+}
+
+/**
+ * Azure OpenAI Chat Completions endpoint.
+ *
+ * Azure uses deployment-scoped URLs:
+ *   https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}
+ *
+ * @param baseUrl    e.g. https://my-resource.openai.azure.com
+ * @param deployment Model/deployment name, e.g. "gpt-4o"
+ * @param apiVersion Azure API version, e.g. "2024-08-01-preview"
+ */
+export function azureChatEndpoint(
+  baseUrl: string,
+  deployment: string,
+  apiVersion = '2024-08-01-preview',
+): string {
+  return `${baseUrl}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
 export function speechEndpoint(baseUrl: string): string {
   return `${baseUrl}/v1/t2a_v2`;
 }

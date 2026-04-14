@@ -1,6 +1,7 @@
 import { defineCommand } from '../../command';
 import { request, requestJson } from '../../client/http';
-import { chatEndpoint } from '../../client/endpoints';
+import { chatEndpoint, openaiChatEndpoint, azureChatEndpoint } from '../../client/endpoints';
+import { toOpenAIRequest, fromOpenAIResponse, extractOpenAIStreamDelta } from '../../client/providers';
 import { parseSSE } from '../../client/stream';
 import { formatOutput, detectOutputFormat } from '../../output/formatter';
 import type { Config } from '../../config/schema';
@@ -12,6 +13,7 @@ import type {
   ContentBlock,
   StreamEvent,
 } from '../../types/api';
+import type { OpenAIChatResponse, OpenAIStreamChunk } from '../../types/openai';
 import { readFileSync } from 'fs';
 import { isInteractive } from '../../utils/env';
 import { promptText, failIfMissing } from '../../utils/prompt';
@@ -146,77 +148,147 @@ export default defineCommand({
       body.tools = tools;
     }
 
+    // Resolve provider: explicit config wins, otherwise auto-detect from base URL.
+    const { detectProvider: detect } = await import('../../client/providers');
+    const provider = config.provider ?? detect(config.baseUrl);
+
     if (config.dryRun) {
-      console.log(formatOutput({ request: body }, format));
+      const dryPayload = provider === 'minimax' ? body : toOpenAIRequest(body);
+      console.log(formatOutput({ request: dryPayload }, format));
       return;
     }
 
-    const url = chatEndpoint(config.baseUrl);
+    // ---- Build endpoint URL based on provider ----
+    let url: string;
+    if (provider === 'azure') {
+      const apiVersion = config.azureApiVersion ?? '2024-08-01-preview';
+      url = azureChatEndpoint(config.baseUrl, model, apiVersion);
+    } else if (provider === 'openai') {
+      url = openaiChatEndpoint(config.baseUrl);
+    } else {
+      url = chatEndpoint(config.baseUrl);
+    }
 
-    if (shouldStream) {
-      const res = await request(config, {
-        url,
-        method: 'POST',
-        body,
-        stream: true,
-        authStyle: 'x-api-key',
-      });
+    const authStyle = 'x-api-key';
 
-      let textContent = '';
-      let inThinking = false;
-      const dim = config.noColor ? '' : '\x1b[2m';
-      const reset = config.noColor ? '' : '\x1b[0m';
-      const isTTY = process.stdout.isTTY;
-      // In TTY mode, write thinking/response headers to stdout for display.
-      // In non-TTY (pipe/agent) mode, write everything but final text to stderr.
-      const statusOut = isTTY ? process.stdout : process.stderr;
-      const resultOut = process.stdout;
+    if (provider !== 'minimax') {
+      // ---- OpenAI / Azure Chat Completions path ----
+      const openAIBody = toOpenAIRequest(body);
 
-      for await (const event of parseSSE(res)) {
-        if (event.data === '[DONE]') break;
-        try {
-          const parsed = JSON.parse(event.data) as StreamEvent;
+      if (shouldStream) {
+        const res = await request(config, {
+          url,
+          method: 'POST',
+          body: openAIBody,
+          stream: true,
+          authStyle,
+        });
 
-          if (parsed.type === 'content_block_start') {
-            if (parsed.content_block.type === 'thinking') {
-              inThinking = true;
-              statusOut.write(`${dim}Thinking:\n`);
-            } else if (parsed.content_block.type === 'text' && inThinking) {
-              statusOut.write(`${reset}\n\nResponse:\n`);
-              inThinking = false;
+        let textContent = '';
+        const resultOut = process.stdout;
+
+        for await (const event of parseSSE(res)) {
+          if (event.data === '[DONE]') break;
+          try {
+            const chunk = JSON.parse(event.data) as OpenAIStreamChunk;
+            const delta = extractOpenAIStreamDelta(chunk);
+            if (delta !== null) {
+              textContent += delta;
+              resultOut.write(delta);
             }
-          } else if (parsed.type === 'content_block_delta') {
-            if (parsed.delta.type === 'text_delta') {
-              textContent += parsed.delta.text;
-              resultOut.write(parsed.delta.text);
-            } else if (parsed.delta.type === 'thinking_delta') {
-              statusOut.write(parsed.delta.thinking);
-            }
+          } catch {
+            // Skip unparseable chunks
           }
-        } catch {
-          // Skip unparseable chunks
+        }
+        resultOut.write('\n');
+
+        if (format === 'json') {
+          console.log(formatOutput({ content: textContent }, format));
+        }
+      } else {
+        const raw = await requestJson<OpenAIChatResponse>(config, {
+          url,
+          method: 'POST',
+          body: openAIBody,
+          authStyle,
+        });
+
+        const response = fromOpenAIResponse(raw);
+        const text = extractText(response.content);
+
+        if (config.quiet || format === 'text') {
+          console.log(text);
+        } else {
+          console.log(formatOutput(response, format));
         }
       }
-      if (inThinking) statusOut.write(reset);
-      resultOut.write('\n');
-
-      if (format === 'json') {
-        console.log(formatOutput({ content: textContent }, format));
-      }
     } else {
-      const response = await requestJson<ChatResponse>(config, {
-        url,
-        method: 'POST',
-        body,
-        authStyle: 'x-api-key',
-      });
+      // ---- MiniMax (Anthropic Messages API) path ----
+      if (shouldStream) {
+        const res = await request(config, {
+          url,
+          method: 'POST',
+          body,
+          stream: true,
+          authStyle: 'x-api-key',
+        });
 
-      const text = extractText(response.content);
+        let textContent = '';
+        let inThinking = false;
+        const dim = config.noColor ? '' : '\x1b[2m';
+        const reset = config.noColor ? '' : '\x1b[0m';
+        const isTTY = process.stdout.isTTY;
+        // In TTY mode, write thinking/response headers to stdout for display.
+        // In non-TTY (pipe/agent) mode, write everything but final text to stderr.
+        const statusOut = isTTY ? process.stdout : process.stderr;
+        const resultOut = process.stdout;
 
-      if (config.quiet || format === 'text') {
-        console.log(text);
+        for await (const event of parseSSE(res)) {
+          if (event.data === '[DONE]') break;
+          try {
+            const parsed = JSON.parse(event.data) as StreamEvent;
+
+            if (parsed.type === 'content_block_start') {
+              if (parsed.content_block.type === 'thinking') {
+                inThinking = true;
+                statusOut.write(`${dim}Thinking:\n`);
+              } else if (parsed.content_block.type === 'text' && inThinking) {
+                statusOut.write(`${reset}\n\nResponse:\n`);
+                inThinking = false;
+              }
+            } else if (parsed.type === 'content_block_delta') {
+              if (parsed.delta.type === 'text_delta') {
+                textContent += parsed.delta.text;
+                resultOut.write(parsed.delta.text);
+              } else if (parsed.delta.type === 'thinking_delta') {
+                statusOut.write(parsed.delta.thinking);
+              }
+            }
+          } catch {
+            // Skip unparseable chunks
+          }
+        }
+        if (inThinking) statusOut.write(reset);
+        resultOut.write('\n');
+
+        if (format === 'json') {
+          console.log(formatOutput({ content: textContent }, format));
+        }
       } else {
-        console.log(formatOutput(response, format));
+        const response = await requestJson<ChatResponse>(config, {
+          url,
+          method: 'POST',
+          body,
+          authStyle: 'x-api-key',
+        });
+
+        const text = extractText(response.content);
+
+        if (config.quiet || format === 'text') {
+          console.log(text);
+        } else {
+          console.log(formatOutput(response, format));
+        }
       }
     }
   },
