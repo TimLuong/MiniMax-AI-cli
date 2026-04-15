@@ -32,6 +32,20 @@ export function speechEndpoint(baseUrl: string): string {
   return `${baseUrl}/v1/t2a_v2`;
 }
 
+/** OpenAI Text-to-Speech endpoint */
+export function openaiSpeechEndpoint(baseUrl: string): string {
+  return `${baseUrl}/v1/audio/speech`;
+}
+
+/** Azure OpenAI Text-to-Speech endpoint */
+export function azureSpeechEndpoint(
+  baseUrl: string,
+  deployment: string,
+  apiVersion = '2024-08-01-preview',
+): string {
+  return `${baseUrl}/openai/deployments/${encodeURIComponent(deployment)}/audio/speech?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
 export function voicesEndpoint(baseUrl: string): string {
   return `${baseUrl}/v1/get_voice`;
 }
@@ -40,12 +54,55 @@ export function imageEndpoint(baseUrl: string): string {
   return `${baseUrl}/v1/image_generation`;
 }
 
+/** OpenAI Images (DALL-E 3, gpt-image-1) endpoint */
+export function openaiImageEndpoint(baseUrl: string): string {
+  return `${baseUrl}/v1/images/generations`;
+}
+
+/** Azure OpenAI Images endpoint */
+export function azureImageEndpoint(
+  baseUrl: string,
+  deployment: string,
+  apiVersion = '2024-02-01',
+): string {
+  return `${baseUrl}/openai/deployments/${encodeURIComponent(deployment)}/images/generations?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
 export function videoGenerateEndpoint(baseUrl: string): string {
   return `${baseUrl}/v1/video_generation`;
 }
 
 export function videoTaskEndpoint(baseUrl: string, taskId: string): string {
   return `${baseUrl}/v1/query/video_generation?task_id=${taskId}`;
+}
+
+/** OpenAI Sora video generation endpoint */
+export function openaiSoraGenerateEndpoint(baseUrl: string): string {
+  return `${baseUrl}/v1/video/generations`;
+}
+
+/** OpenAI Sora task status endpoint */
+export function openaiSoraTaskEndpoint(baseUrl: string, id: string): string {
+  return `${baseUrl}/v1/video/generations/${encodeURIComponent(id)}`;
+}
+
+/** Azure OpenAI Sora video generation endpoint */
+export function azureSoraGenerateEndpoint(
+  baseUrl: string,
+  deployment: string,
+  apiVersion = '2025-02-15-preview',
+): string {
+  return `${baseUrl}/openai/deployments/${encodeURIComponent(deployment)}/videos/generations?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
+/** Azure OpenAI Sora task status endpoint */
+export function azureSoraTaskEndpoint(
+  baseUrl: string,
+  deployment: string,
+  id: string,
+  apiVersion = '2025-02-15-preview',
+): string {
+  return `${baseUrl}/openai/deployments/${encodeURIComponent(deployment)}/videos/generations/${encodeURIComponent(id)}?api-version=${encodeURIComponent(apiVersion)}`;
 }
 
 export function fileRetrieveEndpoint(baseUrl: string, fileId: string): string {

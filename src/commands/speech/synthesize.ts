@@ -2,7 +2,8 @@ import { defineCommand } from '../../command';
 import { CLIError } from '../../errors/base';
 import { ExitCode } from '../../errors/codes';
 import { request, requestJson } from '../../client/http';
-import { speechEndpoint } from '../../client/endpoints';
+import { speechEndpoint, openaiSpeechEndpoint, azureSpeechEndpoint } from '../../client/endpoints';
+import { detectProvider } from '../../client/providers';
 import { parseSSE } from '../../client/stream';
 import { detectOutputFormat, formatOutput } from '../../output/formatter';
 import { saveAudioOutput } from '../../output/audio';
@@ -10,6 +11,8 @@ import { readTextFromPathOrStdin } from '../../utils/fs';
 import type { Config } from '../../config/schema';
 import type { GlobalFlags } from '../../types/flags';
 import type { SpeechRequest, SpeechResponse } from '../../types/api';
+import type { OpenAISpeechRequest } from '../../types/openai';
+import { writeFileSync } from 'fs';
 
 export default defineCommand({
   name: 'speech synthesize',
@@ -17,10 +20,10 @@ export default defineCommand({
   apiDocs: '/docs/api-reference/speech-t2a-http',
   usage: 'mmx speech synthesize --text <text> [--out <path>] [flags]',
   options: [
-    { flag: '--model <model>',           description: 'Model ID (default: speech-2.8-hd)' },
+    { flag: '--model <model>',           description: 'Model ID (MiniMax: speech-2.8-hd | OpenAI: tts-1, tts-1-hd)' },
     { flag: '--text <text>',             description: 'Text to synthesize' },
     { flag: '--text-file <path>',        description: 'Read text from file (use - for stdin)' },
-    { flag: '--voice <id>',              description: 'Voice ID (default: English_expressive_narrator)' },
+    { flag: '--voice <id>',              description: 'Voice ID (MiniMax: English_expressive_narrator | OpenAI: alloy, echo, fable, nova, onyx, shimmer)' },
     { flag: '--speed <n>',               description: 'Speech speed multiplier', type: 'number' },
     { flag: '--volume <n>',              description: 'Volume level', type: 'number' },
     { flag: '--pitch <n>',               description: 'Pitch adjustment', type: 'number' },
@@ -94,11 +97,64 @@ export default defineCommand({
       });
     }
 
+    const provider = config.provider ?? detectProvider(config.baseUrl);
+
     if (config.dryRun) {
-      console.log(formatOutput({ request: body }, format));
+      if (provider !== 'minimax') {
+        const openAIBody: OpenAISpeechRequest = {
+          model,
+          input: text,
+          voice: (voice as OpenAISpeechRequest['voice']) || 'alloy',
+          response_format: ((flags.format as string) || 'mp3') as OpenAISpeechRequest['response_format'],
+          speed: flags.speed as number | undefined,
+        };
+        console.log(formatOutput({ request: openAIBody }, format));
+      } else {
+        console.log(formatOutput({ request: body }, format));
+      }
       return;
     }
 
+    if (provider !== 'minimax') {
+      // ---- OpenAI / Azure TTS path ----
+      const openAIBody: OpenAISpeechRequest = {
+        model: model === 'speech-2.8-hd' ? 'tts-1-hd' : model,
+        input: text,
+        voice: (voice as OpenAISpeechRequest['voice']) || 'alloy',
+        response_format: ((flags.format as string) || 'mp3') as OpenAISpeechRequest['response_format'],
+        speed: flags.speed as number | undefined,
+      };
+
+      let url: string;
+      if (provider === 'azure') {
+        const apiVersion = config.azureApiVersion ?? '2024-08-01-preview';
+        url = azureSpeechEndpoint(config.baseUrl, openAIBody.model, apiVersion);
+      } else {
+        url = openaiSpeechEndpoint(config.baseUrl);
+      }
+
+      // OpenAI TTS returns raw binary audio, not JSON
+      const res = await request(config, { url, method: 'POST', body: openAIBody, authStyle: 'x-api-key' });
+      const audioBuffer = Buffer.from(await res.arrayBuffer());
+
+      if (flags.stream) {
+        process.stdout.write(audioBuffer);
+        return;
+      }
+
+      const savedPath = outPath;
+      writeFileSync(savedPath, audioBuffer);
+      if (!config.quiet) process.stderr.write(`[Model: ${openAIBody.model}]\n`);
+
+      if (config.quiet) {
+        console.log(savedPath);
+      } else {
+        console.log(formatOutput({ saved: savedPath, size_bytes: audioBuffer.length }, format));
+      }
+      return;
+    }
+
+    // ---- MiniMax TTS path ----
     const url = speechEndpoint(config.baseUrl);
 
     if (flags.stream) {

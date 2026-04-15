@@ -2,13 +2,15 @@ import { defineCommand } from '../../command';
 import { CLIError } from '../../errors/base';
 import { ExitCode } from '../../errors/codes';
 import { requestJson } from '../../client/http';
-import { imageEndpoint } from '../../client/endpoints';
+import { imageEndpoint, openaiImageEndpoint, azureImageEndpoint } from '../../client/endpoints';
+import { detectProvider } from '../../client/providers';
 import { downloadFile } from '../../files/download';
 import { formatOutput, detectOutputFormat } from '../../output/formatter';
 import type { Config } from '../../config/schema';
 import type { GlobalFlags } from '../../types/flags';
 import type { ImageRequest, ImageResponse } from '../../types/api';
-import { mkdirSync, existsSync, readFileSync } from 'fs';
+import type { OpenAIImageRequest, OpenAIImageResponse } from '../../types/openai';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { join, resolve, extname } from 'path';
 
 const MIME_TYPES: Record<string, string> = {
@@ -25,27 +27,28 @@ export default defineCommand({
   usage: 'mmx image generate --prompt <text> [flags]',
   options: [
     { flag: '--prompt <text>', description: 'Image description', required: true },
-    { flag: '--aspect-ratio <ratio>', description: 'Aspect ratio (e.g. 16:9, 1:1). Ignored if --width and --height are both specified.' },
-    { flag: '--n <count>', description: 'Number of images to generate (default: 1)', type: 'number' },
-    { flag: '--seed <n>', description: 'Random seed for reproducible generation (same seed + prompt = identical output)', type: 'number' },
-    { flag: '--width <px>', description: 'Custom width in pixels. Range [512, 2048], must be multiple of 8. Only effective for image-01 model. Overrides --aspect-ratio if set.', type: 'number' },
-    { flag: '--height <px>', description: 'Custom height in pixels. Range [512, 2048], must be multiple of 8. Only effective for image-01 model. Overrides --aspect-ratio if set.', type: 'number' },
-    { flag: '--prompt-optimizer', description: 'Automatically optimize the prompt before generation for better results.' },
-    { flag: '--aigc-watermark', description: 'Embed AI-generated content watermark in the output image.' },
-    { flag: '--subject-ref <params>', description: 'Subject reference for character consistency. Format: type=character,image=path-or-url' },
+    { flag: '--model <model>', description: 'Model ID (MiniMax: image-01 | OpenAI: dall-e-3, dall-e-2, gpt-image-1)' },
+    { flag: '--aspect-ratio <ratio>', description: 'Aspect ratio (e.g. 16:9, 1:1). MiniMax only.' },
+    { flag: '--size <size>', description: 'Image size (OpenAI: 1024x1024, 1792x1024, 1024x1792)' },
+    { flag: '--quality <quality>', description: 'Image quality: standard | hd (dall-e-3 / gpt-image-1)' },
+    { flag: '--style <style>', description: 'Image style: vivid | natural (dall-e-3 only)' },
+    { flag: '--n <count>', description: 'Number of images to generate (default: 1; dall-e-3 max: 1)', type: 'number' },
+    { flag: '--seed <n>', description: 'Random seed. MiniMax only.', type: 'number' },
+    { flag: '--width <px>', description: 'Custom width in pixels. MiniMax image-01 only.', type: 'number' },
+    { flag: '--height <px>', description: 'Custom height in pixels. MiniMax image-01 only.', type: 'number' },
+    { flag: '--prompt-optimizer', description: 'Automatically optimize the prompt. MiniMax only.' },
+    { flag: '--aigc-watermark', description: 'Embed AI-generated content watermark. MiniMax only.' },
+    { flag: '--subject-ref <params>', description: 'Subject reference for character consistency. MiniMax only.' },
     { flag: '--out-dir <dir>', description: 'Download images to directory' },
     { flag: '--out-prefix <prefix>', description: 'Filename prefix (default: image)' },
   ],
   examples: [
     'mmx image generate --prompt "A cat in a spacesuit on Mars" --aspect-ratio 16:9',
     'mmx image generate --prompt "Logo design" --n 3 --out-dir ./generated/',
-    'mmx image generate --prompt "Mountain landscape" --quiet',
-    '# Reproducible output with seed',
-    'mmx image generate --prompt "A castle" --seed 42',
-    '# Custom dimensions (must be 512–2048, multiple of 8)',
-    'mmx image generate --prompt "Wide landscape" --width 1920 --height 1080',
-    '# Optimized prompt with watermark',
-    'mmx image generate --prompt "sunset" --prompt-optimizer --aigc-watermark',
+    '# OpenAI DALL-E 3',
+    'mmx image generate --model dall-e-3 --prompt "A futuristic city" --size 1792x1024 --quality hd',
+    '# Azure GPT Image',
+    'mmx image generate --model gpt-image-1 --prompt "Product photo" --quality high --out-dir ./out/',
   ],
   async run(config: Config, flags: GlobalFlags) {
     let prompt = (flags.prompt ?? (flags._positional as string[]|undefined)?.[0]) as string | undefined;
@@ -88,8 +91,76 @@ export default defineCommand({
       validateSize('height', height);
     }
 
+    const format = detectOutputFormat(config.output);
+    const provider = config.provider ?? detectProvider(config.baseUrl);
+    const explicitModel = flags.model as string | undefined;
+
+    if (provider !== 'minimax') {
+      // ---- OpenAI / Azure image generation (DALL-E 3, gpt-image-1) ----
+      const model = explicitModel || 'dall-e-3';
+      const openAIBody: OpenAIImageRequest = {
+        model,
+        prompt,
+        n: (flags.n as number) ?? 1,
+        size: (flags.size as string) || '1024x1024',
+        response_format: 'url',
+      };
+      if (flags.quality) openAIBody.quality = flags.quality as string;
+      if (flags.style) openAIBody.style = flags.style as string;
+
+      if (config.dryRun) {
+        console.log(formatOutput({ request: openAIBody }, format));
+        return;
+      }
+
+      let url: string;
+      if (provider === 'azure') {
+        const apiVersion = config.azureApiVersion ?? '2024-02-01';
+        url = azureImageEndpoint(config.baseUrl, model, apiVersion);
+      } else {
+        url = openaiImageEndpoint(config.baseUrl);
+      }
+
+      const response = await requestJson<OpenAIImageResponse>(config, {
+        url,
+        method: 'POST',
+        body: openAIBody,
+        authStyle: 'x-api-key',
+      });
+
+      if (!config.quiet) process.stderr.write(`[Model: ${model}]\n`);
+
+      const outDir = (flags.outDir as string | undefined) ?? '.';
+      if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+
+      const prefix = (flags.outPrefix as string) || 'image';
+      const saved: string[] = [];
+
+      for (let i = 0; i < response.data.length; i++) {
+        const item = response.data[i]!;
+        const filename = `${prefix}_${String(i + 1).padStart(3, '0')}.png`;
+        const destPath = join(outDir, filename);
+
+        if (item.b64_json) {
+          writeFileSync(destPath, Buffer.from(item.b64_json, 'base64'));
+          saved.push(destPath);
+        } else if (item.url) {
+          await downloadFile(item.url, destPath, { quiet: config.quiet });
+          saved.push(destPath);
+        }
+      }
+
+      if (config.quiet) {
+        console.log(saved.join('\n'));
+      } else {
+        console.log(formatOutput({ model, saved, count: saved.length }, format));
+      }
+      return;
+    }
+
+    // ---- MiniMax image generation ----
     const body: ImageRequest = {
-      model: 'image-01',
+      model: explicitModel || 'image-01',
       prompt,
       aspect_ratio: (width !== undefined && height !== undefined) ? undefined : ((flags.aspectRatio as string) || undefined),
       n: (flags.n as number) ?? 1,
@@ -128,8 +199,6 @@ export default defineCommand({
 
       body.subject_reference = [ref];
     }
-
-    const format = detectOutputFormat(config.output);
 
     if (config.dryRun) {
       console.log(formatOutput({ request: body }, format));

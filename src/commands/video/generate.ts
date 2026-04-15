@@ -2,13 +2,19 @@ import { defineCommand } from '../../command';
 import { CLIError } from '../../errors/base';
 import { ExitCode } from '../../errors/codes';
 import { requestJson } from '../../client/http';
-import { videoGenerateEndpoint, videoTaskEndpoint, fileRetrieveEndpoint } from '../../client/endpoints';
+import {
+  videoGenerateEndpoint, videoTaskEndpoint, fileRetrieveEndpoint,
+  openaiSoraGenerateEndpoint, openaiSoraTaskEndpoint,
+  azureSoraGenerateEndpoint, azureSoraTaskEndpoint,
+} from '../../client/endpoints';
+import { detectProvider } from '../../client/providers';
 import { poll } from '../../polling/poll';
 import { downloadFile, formatBytes } from '../../files/download';
 import { formatOutput, detectOutputFormat } from '../../output/formatter';
 import type { Config } from '../../config/schema';
 import type { GlobalFlags } from '../../types/flags';
 import type { VideoRequest, VideoResponse, VideoTaskResponse, FileRetrieveResponse } from '../../types/api';
+import type { OpenAISoraRequest, OpenAISoraResponse } from '../../types/openai';
 import { readFileSync } from 'fs';
 import { extname } from 'path';
 
@@ -21,16 +27,18 @@ import { promptText, failIfMissing } from '../../utils/prompt';
 
 export default defineCommand({
   name: 'video generate',
-  description: 'Generate a video (T2V: Hailuo-2.3 / 2.3-Fast / Hailuo-02 | I2V: I2V-01 / I2V-01-Director / I2V-01-live | S2V: S2V-01)',
+  description: 'Generate a video (MiniMax: Hailuo-2.3 / I2V-01 / S2V-01 | OpenAI/Azure: Sora)',
   apiDocs: '/docs/api-reference/video-generation',
   usage: 'mmx video generate --prompt <text> [flags]',
   options: [
-    { flag: '--model <model>', description: 'Model ID (default: MiniMax-Hailuo-2.3). Auto-switched to Hailuo-02 with --last-frame, or S2V-01 with --subject-image.' },
+    { flag: '--model <model>', description: 'Model ID (MiniMax: MiniMax-Hailuo-2.3 | OpenAI/Azure: sora)' },
     { flag: '--prompt <text>', description: 'Video description', required: true },
-    { flag: '--first-frame <path-or-url>', description: 'First frame image (local path or URL). Auto base64-encoded for local files.' },
-    { flag: '--last-frame <path-or-url>', description: 'Last frame image (local path or URL). Enables SEF (start-end frame) interpolation mode with Hailuo-02 model. Requires --first-frame.' },
-    { flag: '--subject-image <path-or-url>', description: 'Subject reference image for character consistency (local path or URL). Switches to S2V-01 model.' },
-    { flag: '--callback-url <url>', description: 'Webhook URL for completion notification' },
+    { flag: '--resolution <WxH>', description: 'Video resolution for Sora (e.g. 1280x720, 1920x1080, 720x1280)' },
+    { flag: '--duration <seconds>', description: 'Duration in seconds for Sora (1–20, default: 5)', type: 'number' },
+    { flag: '--first-frame <path-or-url>', description: 'First frame image. MiniMax only.' },
+    { flag: '--last-frame <path-or-url>', description: 'Last frame image (SEF mode). MiniMax only.' },
+    { flag: '--subject-image <path-or-url>', description: 'Subject reference image. MiniMax only.' },
+    { flag: '--callback-url <url>', description: 'Webhook URL for completion notification. MiniMax only.' },
     { flag: '--download <path>', description: 'Save video to file on completion' },
     { flag: '--no-wait', description: 'Return task ID immediately without waiting' },
     { flag: '--async', description: 'Return task ID immediately (agent/CI mode, same as --no-wait but explicit)' },
@@ -39,12 +47,12 @@ export default defineCommand({
   examples: [
     'mmx video generate --prompt "A man reads a book. Static shot."',
     'mmx video generate --prompt "Ocean waves at sunset." --download sunset.mp4',
-    'mmx video generate --prompt "A robot painting." --async --quiet',
-    'mmx video generate --prompt "A robot painting." --no-wait --quiet',
-    '# SEF: first + last frame interpolation (uses Hailuo-02 model)',
+    '# OpenAI Sora',
+    'mmx video generate --model sora --prompt "A cat playing piano" --resolution 1280x720 --duration 5',
+    '# Azure Sora',
+    'mmx video generate --model sora --prompt "City timelapse" --resolution 1920x1080 --download city.mp4',
+    '# MiniMax: SEF interpolation',
     'mmx video generate --prompt "Walk forward" --first-frame start.jpg --last-frame end.jpg',
-    '# Subject reference: character consistency (uses S2V-01 model)',
-    'mmx video generate --prompt "A detective walking" --subject-image character.jpg',
   ],
   async run(config: Config, flags: GlobalFlags) {
     let prompt = flags.prompt as string | undefined;
@@ -62,6 +70,94 @@ export default defineCommand({
       }
     }
 
+    const format = detectOutputFormat(config.output);
+    const provider = config.provider ?? detectProvider(config.baseUrl);
+    const explicitModel = flags.model as string | undefined;
+
+    if (provider !== 'minimax') {
+      // ---- OpenAI / Azure Sora path ----
+      const model = explicitModel || 'sora';
+      const soraBody: OpenAISoraRequest = {
+        model,
+        prompt,
+        resolution: (flags.resolution as string) || '1280x720',
+        n_seconds: (flags.duration as number) || 5,
+        n_variants: 1,
+      };
+
+      if (config.dryRun) {
+        console.log(formatOutput({ request: soraBody }, format));
+        return;
+      }
+
+      let generateUrl: string;
+      const apiVersion = config.azureApiVersion ?? '2025-02-15-preview';
+      if (provider === 'azure') {
+        generateUrl = azureSoraGenerateEndpoint(config.baseUrl, model, apiVersion);
+      } else {
+        generateUrl = openaiSoraGenerateEndpoint(config.baseUrl);
+      }
+
+      const initial = await requestJson<OpenAISoraResponse>(config, {
+        url: generateUrl,
+        method: 'POST',
+        body: soraBody,
+        authStyle: 'x-api-key',
+      });
+
+      const taskId = initial.id;
+      if (!config.quiet) process.stderr.write(`[Model: ${model}] Task: ${taskId}\n`);
+
+      if (flags.noWait || config.async) {
+        process.stdout.write(JSON.stringify({ taskId }));
+        process.stdout.write('\n');
+        return;
+      }
+
+      const pollInterval = (flags.pollInterval as number) ?? 5;
+      const getTaskUrl = (id: string) =>
+        provider === 'azure'
+          ? azureSoraTaskEndpoint(config.baseUrl, model, id, apiVersion)
+          : openaiSoraTaskEndpoint(config.baseUrl, id);
+
+      const result = await poll<OpenAISoraResponse>(config, {
+        url: getTaskUrl(taskId),
+        intervalSec: pollInterval,
+        timeoutSec: config.timeout,
+        isComplete: (d) => (d as OpenAISoraResponse).status === 'completed',
+        isFailed: (d) => (d as OpenAISoraResponse).status === 'failed',
+        getStatus: (d) => (d as OpenAISoraResponse).status,
+      });
+
+      const videoUrl = result.generations?.[0]?.video?.url;
+      if (!videoUrl) {
+        throw new CLIError('Sora task completed but no video URL returned.', ExitCode.GENERAL);
+      }
+
+      if (flags.download) {
+        const destPath = flags.download as string;
+        const { size } = await downloadFile(videoUrl, destPath, { quiet: config.quiet });
+        if (config.quiet) {
+          console.log(destPath);
+        } else {
+          console.log(formatOutput({ task_id: taskId, status: 'completed', saved: destPath, size: formatBytes(size) }, format));
+        }
+        return;
+      }
+
+      const os = await import('os');
+      const { join } = await import('path');
+      const destDir = join(os.tmpdir(), 'mmx-video');
+      const { existsSync, mkdirSync } = await import('fs');
+      if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
+      const destPath = join(destDir, `${taskId}.mp4`);
+      await downloadFile(videoUrl, destPath, { quiet: config.quiet });
+      process.stdout.write(destPath);
+      process.stdout.write('\n');
+      return;
+    }
+
+    // ---- MiniMax video generation path ----
     // Validate mutually exclusive mode flags
     if (flags.lastFrame && flags.subjectImage) {
       throw new CLIError(
@@ -72,7 +168,6 @@ export default defineCommand({
     }
 
     // Determine model: explicit --model > auto-switch > config default > hardcoded
-    const explicitModel = flags.model as string | undefined;
     let model: string;
     if (explicitModel) {
       model = explicitModel;
@@ -83,7 +178,6 @@ export default defineCommand({
     } else {
       model = config.defaultVideoModel || 'MiniMax-Hailuo-2.3';
     }
-    const format = detectOutputFormat(config.output);
 
     const body: VideoRequest = {
       model,
